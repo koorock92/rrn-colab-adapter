@@ -194,7 +194,7 @@ def main() -> None:
     best_psnr = float("-inf")
     last_loss = float("nan")
     if args.resume and args.resume.is_file():
-        checkpoint = torch.load(args.resume, map_location="cpu")
+        checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         scheduler.load_state_dict(checkpoint["scheduler"])
@@ -297,7 +297,7 @@ def main() -> None:
                 improved = validation_psnr > best_psnr
                 if improved:
                     best_psnr = validation_psnr
-                checkpoint = torch.load(last_path, map_location="cpu")
+                checkpoint = torch.load(last_path, map_location="cpu", weights_only=False)
                 checkpoint["best_psnr"] = best_psnr
                 checkpoint["validation_psnr"] = validation_psnr
                 save_checkpoint(last_path, checkpoint)
