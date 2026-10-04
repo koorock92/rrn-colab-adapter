@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.tmp/
+*.pt
+*.pth
+*.lmdb/
+data.mdb
+lock.mdb
+metrics.jsonl

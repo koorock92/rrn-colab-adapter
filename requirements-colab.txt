@@ -1,0 +1,4 @@
+lmdb>=1.4
+numpy
+Pillow
+tqdm
