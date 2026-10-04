@@ -50,6 +50,8 @@ def parse_args():
     parser.add_argument("--step-size", type=int, default=60)
     parser.add_argument("--gamma", type=float, default=0.1)
     parser.add_argument("--save-every", type=int, default=200)
+    parser.add_argument("--metrics-flush-every", type=int, default=100)
+    parser.add_argument("--log-every", type=int, default=25)
     parser.add_argument("--max-steps", type=int)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--seed", type=int, default=0)
@@ -86,21 +88,68 @@ class ShardStager:
         if (target / "data.mdb").is_file():
             return target
         temporary = self.cache / f".{name}.copying"
-        if temporary.exists():
-            shutil.rmtree(temporary)
+        temporary.mkdir(parents=True, exist_ok=True)
+        files = [path for path in source.rglob("*") if path.is_file()]
+        total = sum(path.stat().st_size for path in files)
+        copied = 0
+        for source_file in files:
+            relative = source_file.relative_to(source)
+            target_file = temporary / relative
+            target_file.parent.mkdir(parents=True, exist_ok=True)
+            source_size = source_file.stat().st_size
+            existing = target_file.stat().st_size if target_file.exists() else 0
+            if existing > source_size:
+                target_file.unlink()
+                existing = 0
+            copied += existing
         started = time.perf_counter()
-        shutil.copytree(source, temporary)
+        last_report = started
+        initial = copied
+        print(f"STAGE_START name={name} resumed_gib={initial / 2**30:.2f} total_gib={total / 2**30:.2f}", flush=True)
+        for source_file in files:
+            relative = source_file.relative_to(source)
+            target_file = temporary / relative
+            source_size = source_file.stat().st_size
+            existing = target_file.stat().st_size if target_file.exists() else 0
+            if existing == source_size:
+                continue
+            with source_file.open("rb") as source_stream, target_file.open("ab" if existing else "wb") as target_stream:
+                source_stream.seek(existing)
+                while True:
+                    chunk = source_stream.read(8 * 1024 * 1024)
+                    if not chunk:
+                        break
+                    target_stream.write(chunk)
+                    copied += len(chunk)
+                    now = time.perf_counter()
+                    if now - last_report >= 2.0:
+                        elapsed = max(now - started, 1e-6)
+                        rate = max((copied - initial) / elapsed, 1.0)
+                        remaining = max(total - copied, 0)
+                        print(
+                            f"STAGING name={name} percent={100.0 * copied / max(total, 1):.1f} "
+                            f"copied_gib={copied / 2**30:.2f} total_gib={total / 2**30:.2f} "
+                            f"mib_s={rate / 2**20:.1f} eta_s={remaining / rate:.0f}",
+                            flush=True,
+                        )
+                        last_report = now
+                target_stream.flush()
         temporary.replace(target)
         print(f"STAGED {name} in {time.perf_counter() - started:.1f}s", flush=True)
         return target
 
     def prefetch(self, name: str) -> None:
         if name not in self.futures and not (self.cache / name / "data.mdb").is_file():
+            print(f"PREFETCH_START name={name}", flush=True)
             self.futures[name] = self.pool.submit(self._copy, name)
 
     def get(self, name: str) -> Path:
         future = self.futures.pop(name, None)
-        return future.result() if future else self._copy(name)
+        if future and not future.done():
+            print(f"PREFETCH_WAIT name={name}", flush=True)
+        path = future.result() if future else self._copy(name)
+        print(f"SHARD_READY name={name}", flush=True)
+        return path
 
     def discard(self, name: str) -> None:
         target = (self.cache / name).resolve()
@@ -131,7 +180,10 @@ def make_scaler(enabled: bool):
 def validate_psnr(model, dataset, device, amp: bool) -> float:
     model.eval()
     scores = []
-    progress = tqdm(DataLoader(dataset, batch_size=1, num_workers=0), desc="Validation", unit="clip")
+    progress = tqdm(
+        DataLoader(dataset, batch_size=1, num_workers=0),
+        desc="Validation", unit="clip", disable=not os.isatty(2),
+    )
     for low_resolution, target, _ in progress:
         low_resolution = low_resolution.to(device)
         target = target.to(device)
@@ -210,6 +262,15 @@ def main() -> None:
 
     config = {**vars(args), "shards_root": str(args.shards_root), "cache_dir": str(args.cache_dir), "output": str(args.output), "device_resolved": str(device), "amp_resolved": amp}
     (args.output / "config.json").write_text(json.dumps(config, default=str, indent=2), encoding="utf-8")
+    metrics_buffer: list[str] = []
+
+    def flush_metrics() -> None:
+        if not metrics_buffer:
+            return
+        with metrics_path.open("a", encoding="utf-8") as stream:
+            stream.write("".join(metrics_buffer))
+        metrics_buffer.clear()
+
     stager = ShardStager(args.shards_root, args.cache_dir)
     validation_path = stager.get(validation_name)
     validation_dataset = VimeoSeptupletDataset(validation_path, split="test", scale=args.scale, crop_size=0, augment=False)
@@ -241,7 +302,14 @@ def main() -> None:
                 sampler = FixedOrderSampler(indices[resume_batch * args.batch_size:])
                 loader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler, num_workers=args.workers, pin_memory=use_cuda, drop_last=True, persistent_workers=args.workers > 0)
                 total_batches = len(dataset) // args.batch_size
-                progress = tqdm(loader, total=max(0, total_batches - resume_batch), desc=f"Epoch {epoch}/{args.epochs} shard {shard_position + 1}/{len(order)}", unit="batch")
+                progress = tqdm(
+                    loader,
+                    total=max(0, total_batches - resume_batch),
+                    desc=f"Epoch {epoch}/{args.epochs} shard {shard_position + 1}/{len(order)}",
+                    unit="batch",
+                    disable=not os.isatty(2),
+                )
+                previous_step_finished = time.perf_counter()
                 for local_batch, (low_resolution, target, names) in enumerate(progress):
                     batch_index = resume_batch + local_batch
                     started = time.perf_counter()
@@ -259,12 +327,35 @@ def main() -> None:
                     scaler.update()
                     global_step += 1
                     last_loss = float(loss.detach().cpu())
-                    record = {"epoch": epoch, "shard_position": shard_position, "shard": shard_name, "batch": batch_index + 1, "global_step": global_step, "loss": last_loss, "lr": optimizer.param_groups[0]["lr"], "seconds": time.perf_counter() - started, "sample": names[0]}
-                    with metrics_path.open("a", encoding="utf-8") as stream:
-                        stream.write(json.dumps(record) + "\n")
+                    finished = time.perf_counter()
+                    record = {
+                        "epoch": epoch, "shard_position": shard_position,
+                        "shard": shard_name, "batch": batch_index + 1,
+                        "global_step": global_step, "loss": last_loss,
+                        "lr": optimizer.param_groups[0]["lr"],
+                        "seconds": finished - started,
+                        "wall_seconds": finished - previous_step_finished,
+                        "sample": names[0],
+                    }
+                    previous_step_finished = finished
+                    metrics_buffer.append(json.dumps(record) + "\n")
+                    if len(metrics_buffer) >= args.metrics_flush_every:
+                        flush_metrics()
                     progress.set_postfix(loss=f"{last_loss:.3f}", step=global_step, sec=f"{record['seconds']:.2f}")
+                    if global_step == 1 or global_step % args.log_every == 0:
+                        gpu_mib = torch.cuda.memory_allocated() / 2**20 if use_cuda else 0.0
+                        print(
+                            f"TRAIN epoch={epoch}/{args.epochs} shard={shard_position + 1}/{len(order)} "
+                            f"batch={batch_index + 1}/{total_batches} step={global_step} "
+                            f"loss={last_loss:.4f} compute_s={record['seconds']:.3f} "
+                            f"wall_s={record['wall_seconds']:.3f} "
+                            f"samples_s={args.batch_size / max(record['wall_seconds'], 1e-6):.1f} "
+                            f"gpu_mib={gpu_mib:.0f}",
+                            flush=True,
+                        )
                     reached_limit = args.max_steps is not None and global_step >= args.max_steps
                     if global_step % args.save_every == 0 or reached_limit:
+                        flush_metrics()
                         save_checkpoint(last_path, payload(epoch, shard_position, batch_index + 1))
                     if reached_limit:
                         stop = True
@@ -282,6 +373,7 @@ def main() -> None:
                 improved = validation_psnr > best_psnr
                 if improved:
                     best_psnr = validation_psnr
+                flush_metrics()
                 save_checkpoint(last_path, payload(epoch, shard_position, 0))
                 if improved:
                     best_payload = payload(epoch, shard_position, 0)
@@ -311,6 +403,7 @@ def main() -> None:
             next_batch = 0
             save_checkpoint(last_path, payload(epoch, 0, 0))
     finally:
+        flush_metrics()
         close_dataset(validation_dataset)
         stager.close()
     print(f"TRAINING_STOPPED_AT_STEP={global_step} last={last_path} best={best_path}", flush=True)
