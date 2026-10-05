@@ -60,6 +60,8 @@ def parse_args():
     parser.add_argument("--gpu-downsample", action="store_true")
     parser.add_argument("--decoder", choices=("auto", "pillow", "torchvision", "pyspng"), default="auto")
     parser.add_argument("--prefetch-factor", type=int, default=8)
+    parser.add_argument("--shard-prefetch-ahead", type=int, default=2)
+    parser.add_argument("--shard-prefetch-mib-s", type=float, default=40.0)
     return parser.parse_args()
 
 
@@ -76,14 +78,15 @@ def close_dataset(dataset) -> None:
 
 
 class ShardStager:
-    def __init__(self, source: Path, cache: Path) -> None:
+    def __init__(self, source: Path, cache: Path, prefetch_mib_s: float = 40.0) -> None:
         self.source = source.resolve()
         self.cache = cache.resolve()
+        self.prefetch_mib_s = max(float(prefetch_mib_s), 0.0)
         self.cache.mkdir(parents=True, exist_ok=True)
         self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="shard-copy")
         self.futures: dict[str, Future] = {}
 
-    def _copy(self, name: str) -> Path:
+    def _copy(self, name: str, rate_limit_mib_s: float = 0.0) -> Path:
         source = (self.source / name).resolve()
         target = (self.cache / name).resolve()
         if source.parent != self.source or target.parent != self.cache:
@@ -108,6 +111,8 @@ class ShardStager:
         started = time.perf_counter()
         last_report = started
         initial = copied
+        rate_limit = rate_limit_mib_s * 2**20
+        chunk_size = (1 if rate_limit else 8) * 1024 * 1024
         print(f"STAGE_START name={name} resumed_gib={initial / 2**30:.2f} total_gib={total / 2**30:.2f}", flush=True)
         for source_file in files:
             relative = source_file.relative_to(source)
@@ -119,12 +124,18 @@ class ShardStager:
             with source_file.open("rb") as source_stream, target_file.open("ab" if existing else "wb") as target_stream:
                 source_stream.seek(existing)
                 while True:
-                    chunk = source_stream.read(8 * 1024 * 1024)
+                    chunk = source_stream.read(chunk_size)
                     if not chunk:
                         break
                     target_stream.write(chunk)
                     copied += len(chunk)
                     now = time.perf_counter()
+                    if rate_limit:
+                        expected = (copied - initial) / rate_limit
+                        actual = now - started
+                        if expected > actual:
+                            time.sleep(expected - actual)
+                            now = time.perf_counter()
                     if now - last_report >= 2.0:
                         elapsed = max(now - started, 1e-6)
                         rate = max((copied - initial) / elapsed, 1.0)
@@ -143,8 +154,8 @@ class ShardStager:
 
     def prefetch(self, name: str) -> None:
         if name not in self.futures and not (self.cache / name / "data.mdb").is_file():
-            print(f"PREFETCH_START name={name}", flush=True)
-            self.futures[name] = self.pool.submit(self._copy, name)
+            print(f"PREFETCH_START name={name} limit_mib_s={self.prefetch_mib_s:.1f}", flush=True)
+            self.futures[name] = self.pool.submit(self._copy, name, self.prefetch_mib_s)
 
     def get(self, name: str) -> Path:
         future = self.futures.pop(name, None)
@@ -278,7 +289,7 @@ def main() -> None:
             stream.write("".join(metrics_buffer))
         metrics_buffer.clear()
 
-    stager = ShardStager(args.shards_root, args.cache_dir)
+    stager = ShardStager(args.shards_root, args.cache_dir, args.shard_prefetch_mib_s)
     validation_path = stager.get(validation_name)
     validation_dataset = VimeoSeptupletDataset(
         validation_path, split="test", scale=args.scale, crop_size=0,
@@ -306,8 +317,19 @@ def main() -> None:
                 shard_index = order[shard_position]
                 shard_name = shards[shard_index]["name"]
                 shard_path = stager.get(shard_name)
-                if not args.no_prefetch and shard_position + 1 < len(order):
-                    stager.prefetch(shards[order[shard_position + 1]]["name"])
+                if not args.no_prefetch and args.shard_prefetch_ahead > 0:
+                    # Keep the immediate next shard fully staged before training this
+                    # shard. Copy the shard after that in the background at a bounded
+                    # rate so sequential writes do not starve LMDB random reads.
+                    for offset in range(1, args.shard_prefetch_ahead + 1):
+                        future_position = shard_position + offset
+                        if future_position >= len(order):
+                            break
+                        future_name = shards[order[future_position]]["name"]
+                        if offset == 1:
+                            stager.get(future_name)
+                        else:
+                            stager.prefetch(future_name)
                 dataset = VimeoSeptupletDataset(
                     shard_path,
                     split="train",
