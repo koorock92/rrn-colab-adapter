@@ -58,6 +58,8 @@ def parse_args():
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--no-prefetch", action="store_true")
     parser.add_argument("--gpu-downsample", action="store_true")
+    parser.add_argument("--decoder", choices=("auto", "pillow", "torchvision", "pyspng"), default="auto")
+    parser.add_argument("--prefetch-factor", type=int, default=4)
     return parser.parse_args()
 
 
@@ -274,7 +276,11 @@ def main() -> None:
 
     stager = ShardStager(args.shards_root, args.cache_dir)
     validation_path = stager.get(validation_name)
-    validation_dataset = VimeoSeptupletDataset(validation_path, split="test", scale=args.scale, crop_size=0, augment=False)
+    validation_dataset = VimeoSeptupletDataset(
+        validation_path, split="test", scale=args.scale, crop_size=0,
+        augment=False, decoder=args.decoder,
+    )
+    print(f"INPUT_PIPELINE decoder={validation_dataset.decoder} workers={args.workers} prefetch_factor={args.prefetch_factor}", flush=True)
     close_dataset(validation_dataset)
 
     def payload(next_epoch: int, next_shard: int, next_batch_value: int) -> dict:
@@ -303,12 +309,23 @@ def main() -> None:
                     crop_size=args.crop_size,
                     augment=True,
                     defer_downsample=args.gpu_downsample,
+                    decoder=args.decoder,
                 )
                 close_dataset(dataset)
                 indices = sample_order(len(dataset), args.seed, epoch, shard_index)
                 resume_batch = next_batch
                 sampler = FixedOrderSampler(indices[resume_batch * args.batch_size:])
-                loader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler, num_workers=args.workers, pin_memory=use_cuda, drop_last=True, persistent_workers=args.workers > 0)
+                loader_options = {
+                    "batch_size": args.batch_size,
+                    "sampler": sampler,
+                    "num_workers": args.workers,
+                    "pin_memory": use_cuda,
+                    "drop_last": True,
+                    "persistent_workers": args.workers > 0,
+                }
+                if args.workers > 0:
+                    loader_options["prefetch_factor"] = args.prefetch_factor
+                loader = DataLoader(dataset, **loader_options)
                 total_batches = len(dataset) // args.batch_size
                 progress = tqdm(
                     loader,

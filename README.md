@@ -22,3 +22,9 @@ The upstream repository did not include a license when this adapter was prepared
 The full-training notebook defaults use batch size 16, two data-loader workers,
 AMP, background shard prefetch, and checkpointing to Google Drive every 1,000
 steps.
+
+The input pipeline uses a native PNG decoder when available (`pyspng` first,
+then `torchvision.io`, with Pillow as a compatibility fallback). DataLoader
+workers keep four batches prefetched by default. Use
+`src/benchmark_input_pipeline.py` to compare decoders on a local shard before a
+long Colab run.
