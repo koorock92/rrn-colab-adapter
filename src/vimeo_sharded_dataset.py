@@ -17,23 +17,29 @@ ZIP_PREFIX = "vimeo_septuplet"
 LMDB_LIST_PREFIX = "__lists__"
 
 
-def gaussian_kernel(size: int, sigma: float, dtype: torch.dtype) -> torch.Tensor:
-    coords = torch.arange(size, dtype=dtype) - (size - 1) / 2
+def gaussian_kernel(
+    size: int,
+    sigma: float,
+    dtype: torch.dtype,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    coords = torch.arange(size, dtype=dtype, device=device) - (size - 1) / 2
     kernel_1d = torch.exp(-(coords**2) / (2 * sigma**2))
     kernel_1d /= kernel_1d.sum()
     return torch.outer(kernel_1d, kernel_1d)
 
 
 def gaussian_downsample(frames: torch.Tensor, scale: int) -> torch.Tensor:
-    channels, count, height, width = frames.shape
+    leading = frames.shape[:-2]
+    height, width = frames.shape[-2:]
     flat = frames.contiguous().view(-1, 1, height, width)
     pad = 6 + scale * 2
     extra_h = (scale - height % scale) % scale if scale == 3 else 0
     extra_w = (scale - width % scale) % scale if scale == 3 else 0
     flat = F.pad(flat, (pad, pad + extra_w, pad, pad + extra_h), mode="reflect")
-    kernel = gaussian_kernel(13, 0.4 * scale, flat.dtype).view(1, 1, 13, 13)
+    kernel = gaussian_kernel(13, 0.4 * scale, flat.dtype, flat.device).view(1, 1, 13, 13)
     flat = F.conv2d(flat, kernel, stride=scale)[:, :, 2:-2, 2:-2]
-    return flat.view(channels, count, flat.shape[-2], flat.shape[-1])
+    return flat.view(*leading, flat.shape[-2], flat.shape[-1])
 
 
 class VimeoSeptupletDataset(Dataset):
@@ -45,11 +51,13 @@ class VimeoSeptupletDataset(Dataset):
         crop_size: int = 64,
         max_samples: int | None = None,
         augment: bool = True,
+        defer_downsample: bool = False,
     ) -> None:
         self.source = Path(source)
         self.scale = scale
         self.crop_size = crop_size
         self.augment = augment
+        self.defer_downsample = defer_downsample
         self.is_zip = self.source.is_file()
         self.is_lmdb = (self.source / "data.mdb").is_file()
         self.env = None
@@ -137,6 +145,8 @@ class VimeoSeptupletDataset(Dataset):
         high_resolution = torch.from_numpy(array).permute(3, 0, 1, 2).contiguous()
         if self.scale == 4:
             high_resolution = F.pad(high_resolution, (8, 8, 8, 8), mode="reflect")
+        if self.defer_downsample:
+            return high_resolution, self.samples[index]
         low_resolution = gaussian_downsample(high_resolution, self.scale)
         low_resolution = torch.cat((low_resolution[:, 1:2], low_resolution), dim=1)
         return low_resolution, high_resolution, self.samples[index]

@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader, Sampler
 from tqdm.auto import tqdm
 
 from upstream_rrn_adapter import build_rrn
-from vimeo_sharded_dataset import VimeoSeptupletDataset
+from vimeo_sharded_dataset import VimeoSeptupletDataset, gaussian_downsample
 
 
 class FixedOrderSampler(Sampler):
@@ -57,6 +57,7 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--no-prefetch", action="store_true")
+    parser.add_argument("--gpu-downsample", action="store_true")
     return parser.parse_args()
 
 
@@ -295,7 +296,14 @@ def main() -> None:
                 shard_path = stager.get(shard_name)
                 if not args.no_prefetch and shard_position + 1 < len(order):
                     stager.prefetch(shards[order[shard_position + 1]]["name"])
-                dataset = VimeoSeptupletDataset(shard_path, split="train", scale=args.scale, crop_size=args.crop_size, augment=True)
+                dataset = VimeoSeptupletDataset(
+                    shard_path,
+                    split="train",
+                    scale=args.scale,
+                    crop_size=args.crop_size,
+                    augment=True,
+                    defer_downsample=args.gpu_downsample,
+                )
                 close_dataset(dataset)
                 indices = sample_order(len(dataset), args.seed, epoch, shard_index)
                 resume_batch = next_batch
@@ -310,11 +318,18 @@ def main() -> None:
                     disable=not os.isatty(2),
                 )
                 previous_step_finished = time.perf_counter()
-                for local_batch, (low_resolution, target, names) in enumerate(progress):
+                for local_batch, batch_data in enumerate(progress):
                     batch_index = resume_batch + local_batch
                     started = time.perf_counter()
-                    low_resolution = low_resolution.to(device, non_blocking=use_cuda)
-                    target = target.to(device, non_blocking=use_cuda)
+                    if args.gpu_downsample:
+                        target, names = batch_data
+                        target = target.to(device, non_blocking=use_cuda)
+                        low_resolution = gaussian_downsample(target, args.scale)
+                        low_resolution = torch.cat((low_resolution[:, :, 1:2], low_resolution), dim=2)
+                    else:
+                        low_resolution, target, names = batch_data
+                        low_resolution = low_resolution.to(device, non_blocking=use_cuda)
+                        target = target.to(device, non_blocking=use_cuda)
                     optimizer.zero_grad(set_to_none=True)
                     with autocast_context(device, amp):
                         prediction = model(low_resolution)
