@@ -25,6 +25,6 @@ steps.
 
 The input pipeline uses a native PNG decoder when available (`pyspng` first,
 then `torchvision.io`, with Pillow as a compatibility fallback). DataLoader
-workers keep four batches prefetched by default. Use
+workers keep eight batches prefetched by default. Use
 `src/benchmark_input_pipeline.py` to compare decoders on a local shard before a
 long Colab run.

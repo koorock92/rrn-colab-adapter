@@ -59,7 +59,7 @@ def parse_args():
     parser.add_argument("--no-prefetch", action="store_true")
     parser.add_argument("--gpu-downsample", action="store_true")
     parser.add_argument("--decoder", choices=("auto", "pillow", "torchvision", "pyspng"), default="auto")
-    parser.add_argument("--prefetch-factor", type=int, default=4)
+    parser.add_argument("--prefetch-factor", type=int, default=8)
     return parser.parse_args()
 
 
