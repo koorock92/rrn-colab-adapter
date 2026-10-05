@@ -247,7 +247,9 @@ def main() -> None:
     next_batch = 0
     global_step = 0
     best_psnr = float("-inf")
+    last_validation_psnr = float("nan")
     last_loss = float("nan")
+    checkpoint_step = 0
     if args.resume and args.resume.is_file():
         checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
         model.load_state_dict(checkpoint["model"])
@@ -260,7 +262,9 @@ def main() -> None:
         next_batch = int(checkpoint.get("next_batch", 0))
         global_step = int(checkpoint["global_step"])
         best_psnr = float(checkpoint.get("best_psnr", float("-inf")))
+        last_validation_psnr = float(checkpoint.get("validation_psnr", float("nan")))
         last_loss = float(checkpoint.get("loss", float("nan")))
+        checkpoint_step = global_step
         print(f"RESUMED epoch={epoch} shard_position={shard_position} next_batch={next_batch} step={global_step}", flush=True)
 
     config = {**vars(args), "shards_root": str(args.shards_root), "cache_dir": str(args.cache_dir), "output": str(args.output), "device_resolved": str(device), "amp_resolved": amp}
@@ -289,13 +293,15 @@ def main() -> None:
             "scheduler": scheduler.state_dict(), "scaler": scaler.state_dict(),
             "epoch": next_epoch, "shard_position": next_shard,
             "next_batch": next_batch_value, "global_step": global_step,
-            "loss": last_loss, "best_psnr": best_psnr, "config": config,
+            "loss": last_loss, "best_psnr": best_psnr,
+            "validation_psnr": last_validation_psnr, "config": config,
         }
 
     stop = False
     try:
         while epoch <= args.epochs and not stop:
             order = shard_order(len(shards), args.seed, epoch)
+            epoch_batches = sum(int(item["samples"]) // args.batch_size for item in shards)
             while shard_position < len(order):
                 shard_index = order[shard_position]
                 shard_name = shards[shard_index]["name"]
@@ -327,6 +333,10 @@ def main() -> None:
                     loader_options["prefetch_factor"] = args.prefetch_factor
                 loader = DataLoader(dataset, **loader_options)
                 total_batches = len(dataset) // args.batch_size
+                completed_epoch_batches = sum(
+                    int(shards[order[position]]["samples"]) // args.batch_size
+                    for position in range(shard_position)
+                )
                 progress = tqdm(
                     loader,
                     total=max(0, total_batches - resume_batch),
@@ -351,7 +361,9 @@ def main() -> None:
                     with autocast_context(device, amp):
                         prediction = model(low_resolution)
                         batch, _, temporal, _, _ = low_resolution.shape
-                        loss = criterion(prediction, target) / (batch * temporal)
+                        loss_sum = criterion(prediction, target)
+                        loss = loss_sum / (batch * temporal)
+                        mae = loss_sum.detach() / prediction.numel()
                     if not torch.isfinite(loss):
                         raise RuntimeError(f"Non-finite loss at step {global_step}")
                     scaler.scale(loss).backward()
@@ -363,9 +375,13 @@ def main() -> None:
                     record = {
                         "epoch": epoch, "shard_position": shard_position,
                         "shard": shard_name, "batch": batch_index + 1,
+                        "epoch_batch": completed_epoch_batches + batch_index + 1,
+                        "epoch_batches": epoch_batches,
                         "global_step": global_step, "loss": last_loss,
+                        "mae": float(mae.cpu()),
                         "lr": optimizer.param_groups[0]["lr"],
                         "seconds": finished - started,
+                        "data_seconds": started - previous_step_finished,
                         "wall_seconds": finished - previous_step_finished,
                         "sample": names[0],
                     }
@@ -379,7 +395,11 @@ def main() -> None:
                         print(
                             f"TRAIN epoch={epoch}/{args.epochs} shard={shard_position + 1}/{len(order)} "
                             f"batch={batch_index + 1}/{total_batches} step={global_step} "
-                            f"loss={last_loss:.4f} compute_s={record['seconds']:.3f} "
+                            f"epoch_batch={record['epoch_batch']}/{epoch_batches} "
+                            f"loss={last_loss:.4f} mae={record['mae']:.6f} "
+                            f"lr={record['lr']:.3e} val_psnr={last_validation_psnr:.4f} "
+                            f"best_psnr={best_psnr:.4f} checkpoint_step={checkpoint_step} "
+                            f"data_s={record['data_seconds']:.3f} compute_s={record['seconds']:.3f} "
                             f"wall_s={record['wall_seconds']:.3f} "
                             f"samples_s={args.batch_size / max(record['wall_seconds'], 1e-6):.1f} "
                             f"gpu_mib={gpu_mib:.0f}",
@@ -389,6 +409,8 @@ def main() -> None:
                     if global_step % args.save_every == 0 or reached_limit:
                         flush_metrics()
                         save_checkpoint(last_path, payload(epoch, shard_position, batch_index + 1))
+                        checkpoint_step = global_step
+                        print(f"CHECKPOINT step={checkpoint_step} path={last_path}", flush=True)
                     if reached_limit:
                         stop = True
                         break
@@ -401,12 +423,15 @@ def main() -> None:
                 shard_position += 1
                 close_dataset(validation_dataset)
                 validation_psnr = validate_psnr(model, validation_dataset, device, amp)
+                last_validation_psnr = validation_psnr
                 close_dataset(validation_dataset)
                 improved = validation_psnr > best_psnr
                 if improved:
                     best_psnr = validation_psnr
                 flush_metrics()
                 save_checkpoint(last_path, payload(epoch, shard_position, 0))
+                checkpoint_step = global_step
+                print(f"CHECKPOINT step={checkpoint_step} path={last_path}", flush=True)
                 if improved:
                     best_payload = payload(epoch, shard_position, 0)
                     best_payload["validation_psnr"] = validation_psnr
@@ -417,6 +442,7 @@ def main() -> None:
             if stop:
                 close_dataset(validation_dataset)
                 validation_psnr = validate_psnr(model, validation_dataset, device, amp)
+                last_validation_psnr = validation_psnr
                 close_dataset(validation_dataset)
                 improved = validation_psnr > best_psnr
                 if improved:
