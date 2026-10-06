@@ -52,13 +52,14 @@ def write_lmdb(path: Path, samples: list[str], split: str) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--train-shards", type=int, default=2)
     args = parser.parse_args()
     if args.output.exists():
         shutil.rmtree(args.output)
     args.output.mkdir(parents=True)
 
     shards = []
-    for shard_index in range(2):
+    for shard_index in range(args.train_shards):
         samples = [f"mini/{shard_index:02d}{index:03d}" for index in range(4)]
         shards.append(
             write_lmdb(args.output / f"train-{shard_index:03d}.lmdb", samples, "train")

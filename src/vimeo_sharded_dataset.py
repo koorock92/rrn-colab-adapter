@@ -105,6 +105,7 @@ class VimeoSeptupletDataset(Dataset):
                 readonly=True,
                 lock=False,
                 readahead=False,
+                meminit=False,
                 max_readers=2048,
             )
         return self.env

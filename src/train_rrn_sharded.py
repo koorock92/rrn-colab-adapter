@@ -4,6 +4,7 @@ import argparse
 from contextlib import nullcontext
 from concurrent.futures import Future, ThreadPoolExecutor
 import json
+import lmdb
 import os
 from pathlib import Path
 import random
@@ -60,8 +61,14 @@ def parse_args():
     parser.add_argument("--gpu-downsample", action="store_true")
     parser.add_argument("--decoder", choices=("auto", "pillow", "torchvision", "pyspng"), default="auto")
     parser.add_argument("--prefetch-factor", type=int, default=8)
+    parser.add_argument("--startup-buffer-shards", type=int, default=2)
     parser.add_argument("--shard-prefetch-ahead", type=int, default=2)
     parser.add_argument("--shard-prefetch-mib-s", type=float, default=40.0)
+    parser.add_argument("--copy-retries", type=int, default=3)
+    parser.add_argument("--profile-every", type=int, default=100)
+    parser.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--persistent-workers", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--keep-cache", action=argparse.BooleanOptionalAction, default=True)
     return parser.parse_args()
 
 
@@ -78,20 +85,52 @@ def close_dataset(dataset) -> None:
 
 
 class ShardStager:
-    def __init__(self, source: Path, cache: Path, prefetch_mib_s: float = 40.0) -> None:
+    def __init__(
+        self, source: Path, cache: Path, metadata: dict[str, dict],
+        prefetch_mib_s: float = 40.0, retries: int = 3,
+    ) -> None:
         self.source = source.resolve()
         self.cache = cache.resolve()
         self.prefetch_mib_s = max(float(prefetch_mib_s), 0.0)
+        self.metadata = metadata
+        self.retries = max(int(retries), 1)
         self.cache.mkdir(parents=True, exist_ok=True)
         self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="shard-copy")
         self.futures: dict[str, Future] = {}
+        self.copy_seconds: dict[str, float] = {}
+
+    def _validate(self, path: Path, name: str) -> bool:
+        data_file = path / "data.mdb"
+        expected = self.metadata.get(name, {})
+        if not data_file.is_file():
+            return False
+        expected_bytes = expected.get("data_bytes")
+        if expected_bytes is not None and data_file.stat().st_size != int(expected_bytes):
+            return False
+        expected_entries = expected.get("entries")
+        if expected_entries is not None:
+            try:
+                env = lmdb.open(str(path), readonly=True, lock=False, readahead=False, meminit=False)
+                try:
+                    if env.stat()["entries"] != int(expected_entries):
+                        return False
+                finally:
+                    env.close()
+            except lmdb.Error:
+                return False
+        return True
+
+    def is_ready(self, name: str) -> bool:
+        target = self.cache / name
+        return (target / "READY").is_file() and self._validate(target, name)
 
     def _copy(self, name: str, rate_limit_mib_s: float = 0.0) -> Path:
         source = (self.source / name).resolve()
         target = (self.cache / name).resolve()
         if source.parent != self.source or target.parent != self.cache:
             raise ValueError(f"Unsafe shard name: {name}")
-        if (target / "data.mdb").is_file():
+        if self.is_ready(name):
+            print(f"CACHE_HIT name={name}", flush=True)
             return target
         temporary = self.cache / f".{name}.copying"
         temporary.mkdir(parents=True, exist_ok=True)
@@ -148,20 +187,44 @@ class ShardStager:
                         )
                         last_report = now
                 target_stream.flush()
+        if not self._validate(temporary, name):
+            raise RuntimeError(f"Shard validation failed: {name}")
+        (temporary / "READY").write_text("ready\n", encoding="utf-8")
+        if target.exists():
+            shutil.rmtree(target)
         temporary.replace(target)
-        print(f"STAGED {name} in {time.perf_counter() - started:.1f}s", flush=True)
+        duration = time.perf_counter() - started
+        self.copy_seconds[name] = duration
+        print(f"CACHE_READY name={name} copy_s={duration:.1f}", flush=True)
         return target
 
+    def _copy_with_retry(self, name: str, rate_limit_mib_s: float = 0.0) -> Path:
+        for attempt in range(1, self.retries + 1):
+            try:
+                return self._copy(name, rate_limit_mib_s)
+            except Exception as error:
+                print(f"CACHE_RETRY name={name} attempt={attempt}/{self.retries} error={error!r}", flush=True)
+                if attempt == self.retries:
+                    raise
+                time.sleep(min(2**attempt, 10))
+        raise AssertionError("unreachable")
+
     def prefetch(self, name: str) -> None:
-        if name not in self.futures and not (self.cache / name / "data.mdb").is_file():
+        if name not in self.futures and not self.is_ready(name):
             print(f"PREFETCH_START name={name} limit_mib_s={self.prefetch_mib_s:.1f}", flush=True)
-            self.futures[name] = self.pool.submit(self._copy, name, self.prefetch_mib_s)
+            self.futures[name] = self.pool.submit(self._copy_with_retry, name, self.prefetch_mib_s)
 
     def get(self, name: str) -> Path:
         future = self.futures.pop(name, None)
+        waited = 0.0
         if future and not future.done():
-            print(f"PREFETCH_WAIT name={name}", flush=True)
-        path = future.result() if future else self._copy(name)
+            waiting = time.perf_counter()
+            print(f"CACHE_STARVATION name={name}", flush=True)
+            path = future.result()
+            waited = time.perf_counter() - waiting
+            print(f"CACHE_WAIT_DONE name={name} wait_s={waited:.1f}", flush=True)
+        else:
+            path = future.result() if future else self._copy_with_retry(name)
         print(f"SHARD_READY name={name}", flush=True)
         return path
 
@@ -242,6 +305,20 @@ def main() -> None:
     manifest = json.loads((args.shards_root / "manifest.json").read_text(encoding="utf-8"))
     shards = manifest["train_shards"]
     validation_name = manifest["validation_shard"]["name"]
+    shard_metadata = {item["name"]: item for item in shards}
+    shard_metadata[validation_name] = manifest["validation_shard"]
+    for item in shards:
+        print(
+            f"SHARD_INFO name={item['name']} clips={item.get('samples', -1)} "
+            f"entries={item.get('entries', -1)} size_gib={item.get('data_bytes', 0) / 2**30:.2f}",
+            flush=True,
+        )
+    print(
+        f"SHARD_TOTAL count={len(shards)} clips={sum(int(x.get('samples', 0)) for x in shards)} "
+        f"entries={sum(int(x.get('entries', 0)) for x in shards)} "
+        f"size_gib={sum(int(x.get('data_bytes', 0)) for x in shards) / 2**30:.2f}",
+        flush=True,
+    )
     args.output.mkdir(parents=True, exist_ok=True)
     last_path = args.output / "last.pt"
     best_path = args.output / "best.pt"
@@ -275,6 +352,14 @@ def main() -> None:
         best_psnr = float(checkpoint.get("best_psnr", float("-inf")))
         last_validation_psnr = float(checkpoint.get("validation_psnr", float("nan")))
         last_loss = float(checkpoint.get("loss", float("nan")))
+        if "python_rng_state" in checkpoint:
+            random.setstate(checkpoint["python_rng_state"])
+        if "numpy_rng_state" in checkpoint:
+            np.random.set_state(checkpoint["numpy_rng_state"])
+        if "torch_rng_state" in checkpoint:
+            torch.set_rng_state(checkpoint["torch_rng_state"])
+        if use_cuda and checkpoint.get("cuda_rng_state"):
+            torch.cuda.set_rng_state_all(checkpoint["cuda_rng_state"])
         checkpoint_step = global_step
         print(f"RESUMED epoch={epoch} shard_position={shard_position} next_batch={next_batch} step={global_step}", flush=True)
 
@@ -289,7 +374,10 @@ def main() -> None:
             stream.write("".join(metrics_buffer))
         metrics_buffer.clear()
 
-    stager = ShardStager(args.shards_root, args.cache_dir, args.shard_prefetch_mib_s)
+    stager = ShardStager(
+        args.shards_root, args.cache_dir, shard_metadata,
+        args.shard_prefetch_mib_s, args.copy_retries,
+    )
     validation_path = stager.get(validation_name)
     validation_dataset = VimeoSeptupletDataset(
         validation_path, split="test", scale=args.scale, crop_size=0,
@@ -306,30 +394,36 @@ def main() -> None:
             "next_batch": next_batch_value, "global_step": global_step,
             "loss": last_loss, "best_psnr": best_psnr,
             "validation_psnr": last_validation_psnr, "config": config,
+            "epoch_shard_order": shard_order(len(shards), args.seed, next_epoch),
+            "python_rng_state": random.getstate(),
+            "numpy_rng_state": np.random.get_state(),
+            "torch_rng_state": torch.get_rng_state(),
+            "cuda_rng_state": torch.cuda.get_rng_state_all() if use_cuda else None,
         }
 
     stop = False
     try:
         while epoch <= args.epochs and not stop:
             order = shard_order(len(shards), args.seed, epoch)
+            if epoch == 1 and not args.no_prefetch:
+                startup = min(max(args.startup_buffer_shards, 1), len(order) - shard_position)
+                print(
+                    f"STARTUP_BUFFER count={startup} resume_position={shard_position} "
+                    f"order={','.join(str(x) for x in order)}",
+                    flush=True,
+                )
+                for position in range(shard_position, shard_position + startup):
+                    stager.get(shards[order[position]]["name"])
             epoch_batches = sum(int(item["samples"]) // args.batch_size for item in shards)
             while shard_position < len(order):
                 shard_index = order[shard_position]
                 shard_name = shards[shard_index]["name"]
                 shard_path = stager.get(shard_name)
                 if not args.no_prefetch and args.shard_prefetch_ahead > 0:
-                    # Keep the immediate next shard fully staged before training this
-                    # shard. Copy the shard after that in the background at a bounded
-                    # rate so sequential writes do not starve LMDB random reads.
-                    for offset in range(1, args.shard_prefetch_ahead + 1):
-                        future_position = shard_position + offset
-                        if future_position >= len(order):
-                            break
-                        future_name = shards[order[future_position]]["name"]
-                        if offset == 1:
-                            stager.get(future_name)
-                        else:
-                            stager.prefetch(future_name)
+                    future_position = shard_position + max(args.startup_buffer_shards, 1)
+                    if future_position < len(order):
+                        stager.prefetch(shards[order[future_position]]["name"])
+                shard_training_started = time.perf_counter()
                 dataset = VimeoSeptupletDataset(
                     shard_path,
                     split="train",
@@ -347,9 +441,9 @@ def main() -> None:
                     "batch_size": args.batch_size,
                     "sampler": sampler,
                     "num_workers": args.workers,
-                    "pin_memory": use_cuda,
+                    "pin_memory": bool(use_cuda and args.pin_memory),
                     "drop_last": True,
-                    "persistent_workers": args.workers > 0,
+                    "persistent_workers": bool(args.workers > 0 and args.persistent_workers),
                 }
                 if args.workers > 0:
                     loader_options["prefetch_factor"] = args.prefetch_factor
@@ -370,6 +464,10 @@ def main() -> None:
                 for local_batch, batch_data in enumerate(progress):
                     batch_index = resume_batch + local_batch
                     started = time.perf_counter()
+                    profile = bool(use_cuda and args.profile_every > 0 and (global_step + 1) % args.profile_every == 0)
+                    if profile:
+                        torch.cuda.synchronize()
+                        transfer_started = time.perf_counter()
                     if args.gpu_downsample:
                         target, names = batch_data
                         target = target.to(device, non_blocking=use_cuda)
@@ -379,6 +477,11 @@ def main() -> None:
                         low_resolution, target, names = batch_data
                         low_resolution = low_resolution.to(device, non_blocking=use_cuda)
                         target = target.to(device, non_blocking=use_cuda)
+                    h2d_seconds = float("nan")
+                    if profile:
+                        torch.cuda.synchronize()
+                        h2d_seconds = time.perf_counter() - transfer_started
+                        compute_started = time.perf_counter()
                     optimizer.zero_grad(set_to_none=True)
                     with autocast_context(device, amp):
                         prediction = model(low_resolution)
@@ -391,6 +494,10 @@ def main() -> None:
                     scaler.scale(loss).backward()
                     scaler.step(optimizer)
                     scaler.update()
+                    gpu_compute_seconds = float("nan")
+                    if profile:
+                        torch.cuda.synchronize()
+                        gpu_compute_seconds = time.perf_counter() - compute_started
                     global_step += 1
                     last_loss = float(loss.detach().cpu())
                     finished = time.perf_counter()
@@ -405,6 +512,8 @@ def main() -> None:
                         "seconds": finished - started,
                         "data_seconds": started - previous_step_finished,
                         "wall_seconds": finished - previous_step_finished,
+                        "h2d_seconds": h2d_seconds,
+                        "gpu_compute_seconds": gpu_compute_seconds,
                         "sample": names[0],
                     }
                     previous_step_finished = finished
@@ -425,6 +534,14 @@ def main() -> None:
                             f"wall_s={record['wall_seconds']:.3f} "
                             f"samples_s={args.batch_size / max(record['wall_seconds'], 1e-6):.1f} "
                             f"gpu_mib={gpu_mib:.0f}",
+                            flush=True,
+                        )
+                    if profile:
+                        profiled_step = max(record["data_seconds"] + h2d_seconds + gpu_compute_seconds, 1e-9)
+                        print(
+                            f"PROFILE step={global_step} data_s={record['data_seconds']:.4f} "
+                            f"h2d_s={h2d_seconds:.4f} gpu_compute_s={gpu_compute_seconds:.4f} "
+                            f"step_s={profiled_step:.4f} data_wait_ratio={record['data_seconds'] / profiled_step:.4f}",
                             flush=True,
                         )
                     reached_limit = args.max_steps is not None and global_step >= args.max_steps
@@ -458,8 +575,21 @@ def main() -> None:
                     best_payload = payload(epoch, shard_position, 0)
                     best_payload["validation_psnr"] = validation_psnr
                     save_checkpoint(best_path, best_payload)
-                print(f"SHARD_COMPLETE name={shard_name} validation_psnr={validation_psnr:.4f} best_psnr={best_psnr:.4f}", flush=True)
-                stager.discard(shard_name)
+                train_seconds = time.perf_counter() - shard_training_started
+                copy_seconds = stager.copy_seconds.get(shard_name, 0.0)
+                print(
+                    f"SHARD_COMPLETE name={shard_name} train_s={train_seconds:.1f} copy_s={copy_seconds:.1f} "
+                    f"validation_psnr={validation_psnr:.4f} best_psnr={best_psnr:.4f}",
+                    flush=True,
+                )
+                if copy_seconds and train_seconds < copy_seconds:
+                    print(
+                        f"CACHE_WARNING name={shard_name} train_s={train_seconds:.1f} copy_s={copy_seconds:.1f} "
+                        "message=GPU_may_catch_up_with_downloader",
+                        flush=True,
+                    )
+                if not args.keep_cache:
+                    stager.discard(shard_name)
 
             if stop:
                 close_dataset(validation_dataset)
