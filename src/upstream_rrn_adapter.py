@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import sys
 
 import torch
 from torch import nn
@@ -16,6 +17,10 @@ class SequenceRRN(nn.Module):
         if spec is None or spec.loader is None:
             raise ImportError(upstream_arch)
         module = importlib.util.module_from_spec(spec)
+        # torch.compile/Dynamo re-imports the module that owns traced classes.
+        # Register the dynamically loaded upstream architecture so that import
+        # succeeds during graph capture as well as normal eager execution.
+        sys.modules[spec.name] = module
         spec.loader.exec_module(module)
         self.cell = module.RRN(scale, channels, blocks)
         self.scale = scale
