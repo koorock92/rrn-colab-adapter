@@ -62,6 +62,11 @@ def parse_args():
     parser.add_argument("--prefetch-factor", type=int, default=8)
     parser.add_argument("--shard-prefetch-ahead", type=int, default=2)
     parser.add_argument("--shard-prefetch-mib-s", type=float, default=40.0)
+    parser.add_argument(
+        "--keep-cache",
+        action="store_true",
+        help="Keep staged shards on local disk so later epochs never copy them again.",
+    )
     return parser.parse_args()
 
 
@@ -318,18 +323,15 @@ def main() -> None:
                 shard_name = shards[shard_index]["name"]
                 shard_path = stager.get(shard_name)
                 if not args.no_prefetch and args.shard_prefetch_ahead > 0:
-                    # Keep the immediate next shard fully staged before training this
-                    # shard. Copy the shard after that in the background at a bounded
-                    # rate so sequential writes do not starve LMDB random reads.
+                    # Queue future shards immediately, but never block GPU startup on
+                    # the next shard. get() at the next boundary only waits when the
+                    # background copy has not caught up yet.
                     for offset in range(1, args.shard_prefetch_ahead + 1):
                         future_position = shard_position + offset
                         if future_position >= len(order):
                             break
                         future_name = shards[order[future_position]]["name"]
-                        if offset == 1:
-                            stager.get(future_name)
-                        else:
-                            stager.prefetch(future_name)
+                        stager.prefetch(future_name)
                 dataset = VimeoSeptupletDataset(
                     shard_path,
                     split="train",
@@ -459,7 +461,8 @@ def main() -> None:
                     best_payload["validation_psnr"] = validation_psnr
                     save_checkpoint(best_path, best_payload)
                 print(f"SHARD_COMPLETE name={shard_name} validation_psnr={validation_psnr:.4f} best_psnr={best_psnr:.4f}", flush=True)
-                stager.discard(shard_name)
+                if not args.keep_cache:
+                    stager.discard(shard_name)
 
             if stop:
                 close_dataset(validation_dataset)
