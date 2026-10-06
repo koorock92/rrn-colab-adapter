@@ -15,16 +15,26 @@ The upstream repository did not include a license when this adapter was prepared
 
 1. Keep Vimeo-90K LMDB shards and checkpoints in Google Drive.
 2. Clone this adapter and the upstream project into the Colab VM.
-3. Stage one LMDB shard into /content before training.
+3. Stage two LMDB shards into /content before training and retain all completed shards in the VM cache.
 4. Save last.pt for exact resume and best.pt by validation PSNR.
-5. Run the 20-step smoke test before enabling full training.
+5. Run the resumable 300-step smoke test before enabling full training.
 
 The full-training notebook defaults use batch size 16, two data-loader workers,
 AMP, background shard prefetch, and checkpointing to Google Drive every 1,000
 steps.
+
+Validation defaults to once per epoch (`--validation-scope epoch`) rather than
+once per shard. Shard boundaries still save `last.pt`, so reducing validation
+frequency does not reduce resume safety. Use `--validation-scope shard` only
+when per-shard PSNR is specifically needed.
 
 The input pipeline uses a native PNG decoder when available (`pyspng` first,
 then `torchvision.io`, with Pillow as a compatibility fallback). DataLoader
 workers keep eight batches prefetched by default. Use
 `src/benchmark_input_pipeline.py` to compare decoders on a local shard before a
 long Colab run.
+
+`src/benchmark_rrn_batches.py` measures batches 16/32/48/64 without modifying
+the saved checkpoint. It can also benchmark `torch.compile` with `--compile`;
+the main trainer supports the same optional flag while always saving the
+uncompiled model state for checkpoint compatibility.

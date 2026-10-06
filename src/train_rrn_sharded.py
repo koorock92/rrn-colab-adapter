@@ -69,6 +69,13 @@ def parse_args():
     parser.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--persistent-workers", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--keep-cache", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--validation-scope", choices=("epoch", "shard"), default="epoch")
+    parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--compile-mode",
+        choices=("default", "reduce-overhead", "max-autotune"),
+        default="default",
+    )
     return parser.parse_args()
 
 
@@ -324,8 +331,9 @@ def main() -> None:
     best_path = args.output / "best.pt"
     metrics_path = args.output / "metrics.jsonl"
 
-    model = build_rrn(args.upstream_dir, args.scale, args.channels, args.blocks).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.999), eps=1e-8, weight_decay=args.weight_decay)
+    raw_model = build_rrn(args.upstream_dir, args.scale, args.channels, args.blocks).to(device)
+    model = raw_model
+    optimizer = torch.optim.Adam(raw_model.parameters(), lr=args.lr, betas=(0.9, 0.999), eps=1e-8, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=args.step_size, gamma=args.gamma)
     scaler = make_scaler(amp)
     criterion = nn.L1Loss(reduction="sum")
@@ -340,7 +348,7 @@ def main() -> None:
     checkpoint_step = 0
     if args.resume and args.resume.is_file():
         checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
-        model.load_state_dict(checkpoint["model"])
+        raw_model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         scheduler.load_state_dict(checkpoint["scheduler"])
         if checkpoint.get("scaler"):
@@ -362,6 +370,12 @@ def main() -> None:
             torch.cuda.set_rng_state_all(checkpoint["cuda_rng_state"])
         checkpoint_step = global_step
         print(f"RESUMED epoch={epoch} shard_position={shard_position} next_batch={next_batch} step={global_step}", flush=True)
+
+    if args.compile:
+        if not hasattr(torch, "compile"):
+            raise RuntimeError("torch.compile is unavailable in this PyTorch build")
+        model = torch.compile(raw_model, mode=args.compile_mode)
+        print(f"TORCH_COMPILE mode={args.compile_mode}", flush=True)
 
     config = {**vars(args), "shards_root": str(args.shards_root), "cache_dir": str(args.cache_dir), "output": str(args.output), "device_resolved": str(device), "amp_resolved": amp}
     (args.output / "config.json").write_text(json.dumps(config, default=str, indent=2), encoding="utf-8")
@@ -388,7 +402,7 @@ def main() -> None:
 
     def payload(next_epoch: int, next_shard: int, next_batch_value: int) -> dict:
         return {
-            "model": model.state_dict(), "optimizer": optimizer.state_dict(),
+            "model": raw_model.state_dict(), "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(), "scaler": scaler.state_dict(),
             "epoch": next_epoch, "shard_position": next_shard,
             "next_batch": next_batch_value, "global_step": global_step,
@@ -560,28 +574,37 @@ def main() -> None:
 
                 next_batch = 0
                 shard_position += 1
-                close_dataset(validation_dataset)
-                validation_psnr = validate_psnr(model, validation_dataset, device, amp)
-                last_validation_psnr = validation_psnr
-                close_dataset(validation_dataset)
-                improved = validation_psnr > best_psnr
-                if improved:
-                    best_psnr = validation_psnr
                 flush_metrics()
                 save_checkpoint(last_path, payload(epoch, shard_position, 0))
                 checkpoint_step = global_step
                 print(f"CHECKPOINT step={checkpoint_step} path={last_path}", flush=True)
-                if improved:
-                    best_payload = payload(epoch, shard_position, 0)
-                    best_payload["validation_psnr"] = validation_psnr
-                    save_checkpoint(best_path, best_payload)
                 train_seconds = time.perf_counter() - shard_training_started
                 copy_seconds = stager.copy_seconds.get(shard_name, 0.0)
                 print(
                     f"SHARD_COMPLETE name={shard_name} train_s={train_seconds:.1f} copy_s={copy_seconds:.1f} "
-                    f"validation_psnr={validation_psnr:.4f} best_psnr={best_psnr:.4f}",
+                    f"validation_psnr={last_validation_psnr:.4f} best_psnr={best_psnr:.4f}",
                     flush=True,
                 )
+                if args.validation_scope == "shard":
+                    close_dataset(validation_dataset)
+                    validation_psnr = validate_psnr(model, validation_dataset, device, amp)
+                    last_validation_psnr = validation_psnr
+                    close_dataset(validation_dataset)
+                    improved = validation_psnr > best_psnr
+                    if improved:
+                        best_psnr = validation_psnr
+                    flush_metrics()
+                    save_checkpoint(last_path, payload(epoch, shard_position, 0))
+                    checkpoint_step = global_step
+                    print(
+                        f"VALIDATION_COMPLETE scope=shard epoch={epoch} shard={shard_position}/{len(order)} "
+                        f"psnr={validation_psnr:.4f} best_psnr={best_psnr:.4f}",
+                        flush=True,
+                    )
+                    if improved:
+                        best_payload = payload(epoch, shard_position, 0)
+                        best_payload["validation_psnr"] = validation_psnr
+                        save_checkpoint(best_path, best_payload)
                 if copy_seconds and train_seconds < copy_seconds:
                     print(
                         f"CACHE_WARNING name={shard_name} train_s={train_seconds:.1f} copy_s={copy_seconds:.1f} "
@@ -607,11 +630,33 @@ def main() -> None:
                     save_checkpoint(best_path, checkpoint)
                 break
 
+            improved = False
+            if args.validation_scope == "epoch":
+                close_dataset(validation_dataset)
+                validation_psnr = validate_psnr(model, validation_dataset, device, amp)
+                last_validation_psnr = validation_psnr
+                close_dataset(validation_dataset)
+                improved = validation_psnr > best_psnr
+                if improved:
+                    best_psnr = validation_psnr
+                print(
+                    f"VALIDATION_COMPLETE scope=epoch epoch={epoch} "
+                    f"psnr={validation_psnr:.4f} best_psnr={best_psnr:.4f}",
+                    flush=True,
+                )
             scheduler.step()
             epoch += 1
             shard_position = 0
             next_batch = 0
             save_checkpoint(last_path, payload(epoch, 0, 0))
+            checkpoint_step = global_step
+            if improved:
+                save_checkpoint(best_path, payload(epoch, 0, 0))
+            print(
+                f"EPOCH_COMPLETE epoch={epoch - 1} validation_psnr={last_validation_psnr:.4f} "
+                f"best_psnr={best_psnr:.4f} checkpoint_step={checkpoint_step}",
+                flush=True,
+            )
     finally:
         flush_metrics()
         close_dataset(validation_dataset)

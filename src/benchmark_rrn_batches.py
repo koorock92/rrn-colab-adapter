@@ -30,6 +30,12 @@ def parse_args():
     parser.add_argument("--channels", type=int, default=128)
     parser.add_argument("--blocks", type=int, default=10)
     parser.add_argument("--decoder", default="auto")
+    parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--compile-mode",
+        choices=("default", "reduce-overhead", "max-autotune"),
+        default="default",
+    )
     return parser.parse_args()
 
 
@@ -49,8 +55,13 @@ def main() -> None:
     for batch_size in batch_sizes:
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-        model = build_rrn(args.upstream_dir, args.scale, args.channels, args.blocks).to(device)
-        model.load_state_dict(checkpoint["model"])
+        raw_model = build_rrn(args.upstream_dir, args.scale, args.channels, args.blocks).to(device)
+        raw_model.load_state_dict(checkpoint["model"])
+        model = raw_model
+        if args.compile:
+            if not hasattr(torch, "compile"):
+                raise RuntimeError("torch.compile is unavailable in this PyTorch build")
+            model = torch.compile(raw_model, mode=args.compile_mode)
         model.train()
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=5e-4)
         scaler = make_scaler(True)
@@ -109,7 +120,7 @@ def main() -> None:
         finally:
             if getattr(loader, "_iterator", None) is not None:
                 loader._iterator._shutdown_workers()
-            del iterator, loader, dataset, optimizer, scaler, model
+            del iterator, loader, dataset, optimizer, scaler, model, raw_model
             torch.cuda.empty_cache()
 
         if failed:
@@ -119,6 +130,8 @@ def main() -> None:
             result = {
                 "batch": batch_size,
                 "status": "ok",
+                "compiled": args.compile,
+                "compile_mode": args.compile_mode if args.compile else "none",
                 "decoder": decoder,
                 "steps": len(wall_times),
                 "mean_wall_s": mean_wall,
