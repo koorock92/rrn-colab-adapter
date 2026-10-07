@@ -19,7 +19,10 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Benchmark RRN training batch throughput")
     parser.add_argument("--upstream-dir", type=Path, required=True)
     parser.add_argument("--data", type=Path, required=True)
-    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument(
+        "--checkpoint", type=Path,
+        help="Optional model checkpoint. Omit it to benchmark with random weights.",
+    )
     parser.add_argument("--batches", default="1,2,4,8")
     parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--warmup", type=int, default=5)
@@ -67,14 +70,22 @@ def main() -> None:
         raise RuntimeError("CUDA GPU is required")
     device = torch.device("cuda")
     torch.backends.cudnn.benchmark = True
-    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    checkpoint = None
+    if args.checkpoint:
+        if not args.checkpoint.is_file():
+            raise FileNotFoundError(args.checkpoint)
+        checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+        print(f"BENCHMARK_WEIGHTS checkpoint={args.checkpoint}", flush=True)
+    else:
+        print("BENCHMARK_WEIGHTS random_initialization", flush=True)
     batch_sizes = [int(value) for value in args.batches.split(",")]
 
     for batch_size in batch_sizes:
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         raw_model = build_rrn(args.upstream_dir, args.scale, args.channels, args.blocks).to(device)
-        raw_model.load_state_dict(checkpoint["model"])
+        if checkpoint is not None:
+            raw_model.load_state_dict(checkpoint["model"])
         model = raw_model
         if args.compile:
             if not hasattr(torch, "compile"):
