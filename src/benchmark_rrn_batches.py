@@ -20,13 +20,20 @@ def parse_args():
     parser.add_argument("--upstream-dir", type=Path, required=True)
     parser.add_argument("--data", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--batches", default="16,32,48,64")
+    parser.add_argument("--batches", default="1,2,4,8")
     parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--workers", type=int, default=2)
-    parser.add_argument("--prefetch-factor", type=int, default=8)
+    parser.add_argument("--prefetch-factor", type=int, default=4)
     parser.add_argument("--scale", type=int, default=4)
-    parser.add_argument("--crop-size", type=int, default=64)
+    parser.add_argument(
+        "--lr-crop-size", type=int, default=64,
+        help="Low-resolution crop size; the dataset receives LR crop times scale.",
+    )
+    parser.add_argument(
+        "--crop-size", type=int, default=None,
+        help="Legacy HR crop size. Prefer --lr-crop-size.",
+    )
     parser.add_argument("--channels", type=int, default=128)
     parser.add_argument("--blocks", type=int, default=10)
     parser.add_argument("--decoder", default="auto")
@@ -45,6 +52,17 @@ def percentile(values: list[float], fraction: float) -> float:
 
 def main() -> None:
     args = parse_args()
+    if args.crop_size is not None:
+        if args.crop_size <= 0 or args.crop_size % args.scale:
+            raise ValueError("Legacy --crop-size must be positive and divisible by --scale")
+        hr_crop_size = args.crop_size
+        lr_crop_size = hr_crop_size // args.scale
+    else:
+        if args.lr_crop_size <= 0:
+            raise ValueError("--lr-crop-size must be positive")
+        lr_crop_size = args.lr_crop_size
+        hr_crop_size = lr_crop_size * args.scale
+    print(f"CROP_CONFIG lr_crop={lr_crop_size} hr_crop={hr_crop_size}", flush=True)
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA GPU is required")
     device = torch.device("cuda")
@@ -67,7 +85,7 @@ def main() -> None:
         scaler = make_scaler(True)
         criterion = nn.L1Loss(reduction="sum")
         dataset = VimeoSeptupletDataset(
-            args.data, split="train", scale=args.scale, crop_size=args.crop_size,
+            args.data, split="train", scale=args.scale, crop_size=hr_crop_size,
             augment=True, defer_downsample=True, decoder=args.decoder,
         )
         decoder = dataset.decoder

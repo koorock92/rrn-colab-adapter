@@ -19,9 +19,18 @@ The upstream repository did not include a license when this adapter was prepared
 4. Save last.pt for exact resume and best.pt by validation PSNR.
 5. Run the resumable 300-step smoke test before enabling full training.
 
-The full-training notebook defaults use batch size 16, two data-loader workers,
-AMP, background shard prefetch, and checkpointing to Google Drive every 1,000
-steps.
+The corrected-crop notebook uses a 64x64 low-resolution training crop, which
+corresponds to a 256x256 high-resolution crop for x4 RRN before the degradation
+border is added. This is intentionally different from the legacy
+`--crop-size 64` command, which meant a 64x64 HR crop. New commands should use
+`--lr-crop-size 64`; `--crop-size` remains only for backward compatibility.
+
+For an 8-vCPU Colab VM the notebook defaults to six DataLoader workers and a
+prefetch factor of four, leaving two cores for the main process, shard copier,
+and notebook. It uses paper-equivalent batch size 4, AMP, background shard
+prefetch, and checkpointing to Google Drive every 1,000 steps. The corrected
+run is written to a new output directory and initialized from the previous
+`best.pt`, so the completed run remains untouched.
 
 Validation defaults to once per epoch (`--validation-scope epoch`) rather than
 once per shard. Shard boundaries still save `last.pt`, so reducing validation
@@ -30,11 +39,12 @@ when per-shard PSNR is specifically needed.
 
 The input pipeline uses a native PNG decoder when available (`pyspng` first,
 then `torchvision.io`, with Pillow as a compatibility fallback). DataLoader
-workers keep eight batches prefetched by default. Use
+workers keep four batches prefetched per worker by default. Use
 `src/benchmark_input_pipeline.py` to compare decoders on a local shard before a
 long Colab run.
 
-`src/benchmark_rrn_batches.py` measures batches 16/32/48/64 without modifying
+`src/benchmark_rrn_batches.py` measures batches 1/2/4/8 with the corrected crop
+without modifying
 the saved checkpoint. It can also benchmark `torch.compile` with `--compile`;
 the main trainer supports the same optional flag while always saving the
 uncompiled model state for checkpoint compatibility.

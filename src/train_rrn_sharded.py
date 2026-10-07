@@ -40,7 +40,14 @@ def parse_args():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--scale", type=int, default=4)
-    parser.add_argument("--crop-size", type=int, default=64)
+    parser.add_argument(
+        "--lr-crop-size", type=int, default=64,
+        help="Low-resolution training crop size. The matching HR crop is this value times --scale.",
+    )
+    parser.add_argument(
+        "--crop-size", type=int, default=None,
+        help="Legacy HR crop size. Prefer --lr-crop-size; retained for old commands/checkpoints.",
+    )
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--channels", type=int, default=128)
@@ -55,12 +62,16 @@ def parse_args():
     parser.add_argument("--log-every", type=int, default=25)
     parser.add_argument("--max-steps", type=int)
     parser.add_argument("--resume", type=Path)
+    parser.add_argument(
+        "--init-weights", type=Path,
+        help="Initialize model weights from a checkpoint but start a fresh optimizer/schedule/run.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--no-prefetch", action="store_true")
     parser.add_argument("--gpu-downsample", action="store_true")
     parser.add_argument("--decoder", choices=("auto", "pillow", "torchvision", "pyspng"), default="auto")
-    parser.add_argument("--prefetch-factor", type=int, default=8)
+    parser.add_argument("--prefetch-factor", type=int, default=4)
     parser.add_argument("--startup-buffer-shards", type=int, default=2)
     parser.add_argument("--shard-prefetch-ahead", type=int, default=2)
     parser.add_argument("--shard-prefetch-mib-s", type=float, default=40.0)
@@ -297,6 +308,23 @@ def sample_order(count: int, seed: int, epoch: int, shard_index: int) -> list[in
 
 def main() -> None:
     args = parse_args()
+    if args.resume and args.init_weights:
+        raise ValueError("Use only one of --resume and --init-weights")
+    if args.crop_size is not None:
+        if args.crop_size <= 0 or args.crop_size % args.scale:
+            raise ValueError("Legacy --crop-size must be positive and divisible by --scale")
+        hr_crop_size = args.crop_size
+        lr_crop_size = hr_crop_size // args.scale
+        print(
+            f"LEGACY_CROP hr_crop={hr_crop_size} lr_crop={lr_crop_size}; "
+            "prefer --lr-crop-size",
+            flush=True,
+        )
+    else:
+        if args.lr_crop_size <= 0:
+            raise ValueError("--lr-crop-size must be positive")
+        lr_crop_size = args.lr_crop_size
+        hr_crop_size = lr_crop_size * args.scale
     use_cuda = torch.cuda.is_available() if args.device == "auto" else args.device == "cuda"
     if use_cuda and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but unavailable")
@@ -370,6 +398,13 @@ def main() -> None:
             torch.cuda.set_rng_state_all(checkpoint["cuda_rng_state"])
         checkpoint_step = global_step
         print(f"RESUMED epoch={epoch} shard_position={shard_position} next_batch={next_batch} step={global_step}", flush=True)
+    elif args.init_weights:
+        if not args.init_weights.is_file():
+            raise FileNotFoundError(args.init_weights)
+        checkpoint = torch.load(args.init_weights, map_location="cpu", weights_only=False)
+        state_dict = checkpoint.get("model", checkpoint)
+        raw_model.load_state_dict(state_dict)
+        print(f"INITIALIZED_WEIGHTS path={args.init_weights}", flush=True)
 
     if args.compile:
         if not hasattr(torch, "compile"):
@@ -377,7 +412,16 @@ def main() -> None:
         model = torch.compile(raw_model, mode=args.compile_mode)
         print(f"TORCH_COMPILE mode={args.compile_mode}", flush=True)
 
-    config = {**vars(args), "shards_root": str(args.shards_root), "cache_dir": str(args.cache_dir), "output": str(args.output), "device_resolved": str(device), "amp_resolved": amp}
+    config = {
+        **vars(args),
+        "lr_crop_size_resolved": lr_crop_size,
+        "hr_crop_size_resolved": hr_crop_size,
+        "shards_root": str(args.shards_root),
+        "cache_dir": str(args.cache_dir),
+        "output": str(args.output),
+        "device_resolved": str(device),
+        "amp_resolved": amp,
+    }
     (args.output / "config.json").write_text(json.dumps(config, default=str, indent=2), encoding="utf-8")
     metrics_buffer: list[str] = []
 
@@ -397,7 +441,11 @@ def main() -> None:
         validation_path, split="test", scale=args.scale, crop_size=0,
         augment=False, decoder=args.decoder,
     )
-    print(f"INPUT_PIPELINE decoder={validation_dataset.decoder} workers={args.workers} prefetch_factor={args.prefetch_factor}", flush=True)
+    print(
+        f"INPUT_PIPELINE decoder={validation_dataset.decoder} workers={args.workers} "
+        f"prefetch_factor={args.prefetch_factor} lr_crop={lr_crop_size} hr_crop={hr_crop_size}",
+        flush=True,
+    )
     close_dataset(validation_dataset)
 
     def payload(next_epoch: int, next_shard: int, next_batch_value: int) -> dict:
@@ -442,7 +490,7 @@ def main() -> None:
                     shard_path,
                     split="train",
                     scale=args.scale,
-                    crop_size=args.crop_size,
+                    crop_size=hr_crop_size,
                     augment=True,
                     defer_downsample=args.gpu_downsample,
                     decoder=args.decoder,
